@@ -1,0 +1,60 @@
+{
+  "usage_plans_sample_data": [
+    {
+      "plan_id": "free-tier-001",
+      "name": "Free Tier",
+      "tier": "Free",
+      "rate_limit": 10,
+      "burst_limit": 20,
+      "quota_limit": 1000,
+      "quota_period": "MONTH",
+      "lifecycle_state": "Active",
+      "created_at": "2024-01-15T10:30:00Z"
+    },
+    {
+      "plan_id": "basic-tier-001",
+      "name": "Basic Tier",
+      "tier": "Basic",
+      "rate_limit": 50,
+      "burst_limit": 100,
+      "quota_limit": 10000,
+      "quota_period": "MONTH",
+      "lifecycle_state": "Active",
+      "created_at": "2024-01-15T10:35:00Z"
+    },
+    {
+      "plan_id": "premium-tier-001",
+      "name": "Premium Tier",
+      "tier": "Premium",
+      "rate_limit": 200,
+      "burst_limit": 400,
+      "quota_limit": 100000,
+      "quota_period": "MONTH",
+      "lifecycle_state": "Active",
+      "created_at": "2024-01-15T10:40:00Z"
+    },
+    {
+      "plan_id": "enterprise-tier-001",
+      "name": "Enterprise Tier",
+      "tier": "Enterprise",
+      "rate_limit": 1000,
+      "burst_limit": 2000,
+      "quota_limit": 1000000,
+      "quota_period": "MONTH",
+      "lifecycle_state": "Active",
+      "created_at": "2024-01-15T10:45:00Z"
+    },
+    {
+      "plan_id": "legacy-tier-001",
+      "name": "Legacy Tier",
+      "tier": "Legacy",
+      "rate_limit": 25,
+      "burst_limit": 50,
+      "quota_limit": 5000,
+      "quota_period": "MONTH",
+      "lifecycle_state": "Deprecated",
+      "created_at": "2023-06-01T08:00:00Z",
+      "deprecated_at": "2024-01-01T00:00:00Z"
+    }
+  ]
+}

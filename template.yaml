@@ -1,0 +1,979 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: API Gateway Usage Plans Management System
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    Environment:
+      Variables:
+        USAGE_PLANS_TABLE: !Ref UsagePlansTable
+        VERSION_LOG_TABLE: !Ref VersionLogTable
+        NOTIFICATIONS_TOPIC: !Ref NotificationsTopic
+    KmsKeyArn: !GetAtt LambdaKMSKey.Arn
+
+Resources:
+  # KMS Customer Managed Key for DynamoDB Encryption
+  DynamoDBKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer managed key for DynamoDB table encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+  DynamoDBKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/dynamodb-usage-plans-cmk
+      TargetKeyId: !Ref DynamoDBKMSKey
+
+  # KMS Customer Managed Key for Lambda Environment Variables
+  LambdaKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer managed key for Lambda environment variable encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+  LambdaKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/lambda-usage-plans-cmk
+      TargetKeyId: !Ref LambdaKMSKey
+
+  # Config one-click configuration
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: default
+      RecordingGroup:
+        AllSupported: true
+      RoleARN: !GetAtt ConfigRole.Arn
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: default
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: Six_Hours
+
+  # S3 Bucket for Access Logs
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub access-logs-bucket-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket for Replication
+  ConfigBucketReplica:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub config-bucket-replica-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: config-bucket-replica-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Role for S3 Replication
+  S3ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReplicationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:ListBucket
+                Resource: !Sub arn:aws:s3:::config-bucket-${AWS::AccountId}-${AWS::Region}*
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                Resource: !Sub arn:aws:s3:::config-bucket-replica-${AWS::AccountId}-${AWS::Region}/*
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub config-bucket-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: config-bucket-logs/
+      ReplicationConfiguration:
+        Role: !GetAtt S3ReplicationRole.Arn
+        Rules:
+          - Status: Enabled
+            Priority: 1
+            DeleteMarkerReplication:
+              Status: Enabled
+            Filter:
+              Prefix: ''
+            Destination:
+              Bucket: !Sub arn:aws:s3:::${ConfigBucketReplica}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Managed Policy for Config Bucket Access
+  ConfigBucketAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource: !Sub arn:aws:s3:::${ConfigBucket}/*
+            Condition:
+              StringLike:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+        - !Ref ConfigBucketAccessPolicy
+  # DynamoDB Table for Usage Plans
+  UsagePlansTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: plan_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: plan_id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # DynamoDB Table for Version Logging
+  VersionLogTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      AttributeDefinitions:
+        - AttributeName: plan_id
+          AttributeType: S
+        - AttributeName: version_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: plan_id
+          KeyType: HASH
+        - AttributeName: version_timestamp
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Lambda for UC1.1 - Usage Plan Creation/Management
+  UsagePlanManagerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/usage_plan_manager/
+      Handler: handler.lambda_handler
+      ReservedConcurrentExecutions: 1
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Policies:
+        - VPCAccessPolicy: {}
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsagePlansTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - apigateway:*
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !GetAtt DynamoDBKMSKey.Arn
+
+  # Lambda for UC1.2 - Lifecycle Management
+  LifecycleManagerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lifecycle_manager/
+      Handler: handler.lambda_handler
+      ReservedConcurrentExecutions: 1
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Policies:
+        - VPCAccessPolicy: {}
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsagePlansTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationsTopic.TopicName
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - apigateway:*
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !GetAtt DynamoDBKMSKey.Arn
+
+  # VPC Configuration
+  LambdaVPC:
+    Type: AWS::EC2::VPC
+    DeletionPolicy: Delete
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: LambdaVPC
+
+  # Public Subnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Delete
+    Properties:
+      VpcId: !Ref LambdaVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  # Private Subnet
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Delete
+    Properties:
+      VpcId: !Ref LambdaVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DeletionPolicy: Delete
+    Properties:
+      Tags:
+        - Key: Name
+          Value: LambdaIGW
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DeletionPolicy: Delete
+    Properties:
+      VpcId: !Ref LambdaVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Elastic IP for NAT Gateway
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DeletionPolicy: Delete
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  # NAT Gateway in Public Subnet
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DeletionPolicy: Delete
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: LambdaNAT
+
+  # Route Table for Public Subnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DeletionPolicy: Delete
+    Properties:
+      VpcId: !Ref LambdaVPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  # Route Table for Private Subnet
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    DeletionPolicy: Delete
+    Properties:
+      VpcId: !Ref LambdaVPC
+      Tags:
+        - Key: Name
+          Value: PrivateRouteTable
+
+  # Public Route to Internet Gateway
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    DeletionPolicy: Delete
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Private Route to NAT Gateway
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    DeletionPolicy: Delete
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # Associate Public Subnet with Public Route Table
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DeletionPolicy: Delete
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  # Associate Private Subnet with Private Route Table
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DeletionPolicy: Delete
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet
+
+  # Security Group for Lambda Functions
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DeletionPolicy: Delete
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref LambdaVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for AWS API calls
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS resolution
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS resolution
+
+  # KMS Key for SNS Topic Encryption
+  SNSKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer managed key for SNS topic encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+  SNSKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/sns-usage-plans-cmk
+      TargetKeyId: !Ref SNSKMSKey
+
+  # SQS Queue for Lambda Dead Letter Queue
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days in seconds
+      KmsMasterKeyId: !Ref SNSKMSKey
+
+  # SNS Topic for Notifications
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: usage-plan-notifications
+      KmsMasterKeyId: !Ref SNSKMSKey
+
+  # IAM Role for API Gateway CloudWatch Logs
+  ApiGatewayCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # API Gateway Account Configuration
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchLogsRole.Arn
+
+  # KMS Key for CloudWatch Logs Encryption
+  CloudWatchLogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer managed key for CloudWatch Logs encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+  # CloudWatch Log Group for API Gateway Access Logs
+  ApiGatewayAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}-access-logs
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+
+  # API Gateway Lifecycle Management
+  LifecycleAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId", "ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime",
+          "httpMethod":"$context.httpMethod",
+          "resourcePath":"$context.resourcePath", "status":"$context.status",
+          "responseLength":"$context.responseLength"}'
+      CacheClusterEnabled: true
+      CacheClusterSize: '0.5'
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          CachingEnabled: true
+          CacheTtlInSeconds: 300
+      Cors:
+        AllowMethods: '''GET,POST,PUT,DELETE'''
+        AllowHeaders: '''Content-Type,X-Amz-Date,Authorization,X-Api-Key'''
+        AllowOrigin: '''*'''
+      DefinitionBody:
+        openapi: 3.0.1
+        info:
+          title: Usage Plan Management API
+          version: 1.0.0
+        paths:
+          /usage-plans:
+            post:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsagePlanManagerFunction.Arn}/invocations
+            put:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsagePlanManagerFunction.Arn}/invocations
+            get:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsagePlanManagerFunction.Arn}/invocations
+          /usage-plans/{planId}:
+            get:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsagePlanManagerFunction.Arn}/invocations
+            put:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsagePlanManagerFunction.Arn}/invocations
+          /lifecycle/{planId}:
+            post:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LifecycleManagerFunction.Arn}/invocations
+            get:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LifecycleManagerFunction.Arn}/invocations
+
+  # Lambda for UC1.3 - Configuration Enforcement  
+  ConfigurationEnforcementFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/configuration_enforcement/
+      Handler: handler.lambda_handler
+      ReservedConcurrentExecutions: 1
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Policies:
+        - VPCAccessPolicy: {}
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsagePlansTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationsTopic.TopicName
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - apigateway:GET
+                - apigateway:PATCH
+                - apigateway:GetUsagePlan
+                - apigateway:GetUsagePlans
+                - apigateway:GetStage
+                - apigateway:GetStages
+                - apigateway:UpdateUsagePlan
+                - apigateway:DELETE
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource:
+                - !GetAtt DynamoDBKMSKey.Arn
+                - !GetAtt SNSKMSKey.Arn
+      Events:
+        UsagePlanConfigChange:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.apigateway
+              detail-type:
+                - AWS API Call via CloudTrail
+              detail:
+                eventSource:
+                  - apigateway.amazonaws.com
+                eventName:
+                  - UpdateUsagePlan
+        UsagePlanCreated:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.apigateway
+              detail-type:
+                - AWS API Call via CloudTrail
+              detail:
+                eventSource:
+                  - apigateway.amazonaws.com
+                eventName:
+                  - CreateUsagePlan
+
+  # Lambda for Usage Plan Recovery
+  UsagePlanRecoveryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/usage_plan_recovery/
+      Handler: handler.lambda_handler
+      ReservedConcurrentExecutions: 1
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Policies:
+        - VPCAccessPolicy: {}
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsagePlansTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationsTopic.TopicName
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - apigateway:GET
+                - apigateway:POST
+                - apigateway:PATCH
+                - apigateway:CreateUsagePlan
+                - apigateway:GetUsagePlan
+                - apigateway:GetUsagePlans
+                - apigateway:UpdateUsagePlan
+                - apigateway:CreateUsagePlanKey
+                - apigateway:UpdateStage
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !GetAtt DynamoDBKMSKey.Arn
+      Events:
+        UsagePlanDeleted:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.apigateway
+              detail-type:
+                - AWS API Call via CloudTrail
+              detail:
+                eventSource:
+                  - apigateway.amazonaws.com
+                eventName:
+                  - DeleteUsagePlan
+
+  # Config Rule for Usage Plan Compliance
+  UsagePlanComplianceRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: usage-plan-compliance-check
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt UsagePlanComplianceFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::ApiGateway::Stage
+    DependsOn: ConfigCompliancePermission
+
+  # Lambda for Usage Plan Compliance Checking
+  UsagePlanComplianceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/config_compliance/
+      Handler: handler.lambda_handler
+      ReservedConcurrentExecutions: 1
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Policies:
+        - VPCAccessPolicy: {}
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsagePlansTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - config:PutEvaluations
+                - apigateway:GET
+                - apigateway:GetUsagePlan
+                - apigateway:GetUsagePlans
+                - apigateway:DeleteUsagePlan
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !GetAtt DynamoDBKMSKey.Arn
+
+  # Permission for Config to invoke compliance function
+  ConfigCompliancePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UsagePlanComplianceFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # Lambda for Version Logging
+  VersionLoggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/version_logger/
+      Handler: handler.lambda_handler
+      ReservedConcurrentExecutions: 1
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt VersionLogTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+                - dynamodb:ListStreams
+              Resource: !GetAtt UsagePlansTable.StreamArn
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !GetAtt DynamoDBKMSKey.Arn
+      Environment:
+        Variables:
+          VERSION_LOG_TABLE: !Ref VersionLogTable
+      Events:
+        DynamoDBStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt UsagePlansTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+
+  # Lambda for Data Population
+  DataPopulatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/data_populator/
+      Handler: handler.lambda_handler
+      ReservedConcurrentExecutions: 1
+      Timeout: 60
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Policies:
+        - VPCAccessPolicy: {}
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsagePlansTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - apigateway:*
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !GetAtt DynamoDBKMSKey.Arn
+
+  # Custom Resource to Populate Data
+  PopulateDataResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DataPopulatorFunction.Arn
+      TableName: !Ref UsagePlansTable
+      LifecycleAPIId: !Ref LifecycleAPI
+
+  # Lambda Permissions for API Gateway
+  UsagePlanManagerApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UsagePlanManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LifecycleAPI}/*/*
+
+  LifecycleManagerApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LifecycleManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LifecycleAPI}/*/*
+
+  # Permission for CloudFormation to invoke data populator
+  DataPopulatorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataPopulatorFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudformation.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+Outputs:
+  UsagePlansTableName:
+    Description: DynamoDB table for usage plans
+    Value: !Ref UsagePlansTable
+
+  UsagePlanManagerArn:
+    Description: Usage Plan Manager Lambda ARN
+    Value: !GetAtt UsagePlanManagerFunction.Arn
+
+  LifecycleManagerArn:
+    Description: Lifecycle Manager Lambda ARN
+    Value: !GetAtt LifecycleManagerFunction.Arn
+
+  StageApiUrl:
+    Description: API Gateway endpoint URL for testing
+    Value: !Sub https://${LifecycleAPI}.execute-api.${AWS::Region}.amazonaws.com/Stage
+
+  DataPopulationStatus:
+    Description: Status of sample data population
+    Value: !Ref PopulateDataResource
+
+  VersionLogTableName:
+    Description: DynamoDB table for version logging
+    Value: !Ref VersionLogTable
+
+  VersionLoggerArn:
+    Description: Version Logger Lambda ARN
+    Value: !GetAtt VersionLoggerFunction.Arn
