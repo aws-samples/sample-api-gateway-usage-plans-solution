@@ -763,7 +763,9 @@ Resources:
               Action:
                 - kms:Decrypt
                 - kms:GenerateDataKey
-              Resource: !GetAtt DynamoDBKMSKey.Arn
+              Resource:
+                - !GetAtt DynamoDBKMSKey.Arn
+                - !GetAtt SNSKMSKey.Arn
       Events:
         UsagePlanDeleted:
           Type: EventBridgeRule
