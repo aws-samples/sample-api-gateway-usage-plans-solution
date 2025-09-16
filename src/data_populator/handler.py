@@ -1,6 +1,7 @@
 import json
 import boto3
 import urllib3
+import urllib.parse
 import time
 from decimal import Decimal
 
@@ -212,7 +213,17 @@ def send_response(event, context, status, data):
         'LogicalResourceId': event['LogicalResourceId'],
         'Data': data
     }
-    
+
+    # Validate that the ResponseURL points to an AWS domain to mitigate SSRF
+    parsed_url = urllib.parse.urlparse(event['ResponseURL'])
+    allowed_suffixes = [
+        '.amazonaws.com',
+    ]
+    if not any(parsed_url.hostname and parsed_url.hostname.endswith(suffix) for suffix in allowed_suffixes):
+        # Defensive: do not attempt to send response if URL is not AWS
+        print(f"Blocked attempted send_response to unapproved host: {parsed_url.hostname}")
+        raise ValueError(f"ResponseURL host is not allowed: {parsed_url.hostname}")
+
     http = urllib3.PoolManager()
     response = http.request(
         'PUT',
