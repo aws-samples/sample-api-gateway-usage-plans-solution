@@ -868,3 +868,11 @@ These cleanup scripts are designed for **DEVELOPMENT AND TESTING ONLY**. Running
 - Maintain proper backup and rollback procedures
 
 **Remember: These scripts will delete resources across ALL regions if you use `--all-regions`. Always double-check your AWS account and region before running.**
+
+## Security
+
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the LICENSE file.
