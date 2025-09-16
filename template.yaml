@@ -17,8 +17,6 @@ Resources:
   # KMS Customer Managed Key for DynamoDB Encryption
   DynamoDBKMSKey:
     Type: AWS::KMS::Key
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
     Properties:
       Description: Customer managed key for DynamoDB table encryption
       EnableKeyRotation: true
@@ -332,8 +330,8 @@ Resources:
                 - kms:Decrypt
                 - kms:GenerateDataKey
               Resource: 
-               - !GetAtt DynamoDBKMSKey.Arn
-               - !Ref SNSKMSKey
+                - !GetAtt DynamoDBKMSKey.Arn
+                - !Ref SNSKMSKey.Arn
 
   # VPC Configuration
   LambdaVPC:
