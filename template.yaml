@@ -331,7 +331,7 @@ Resources:
                 - kms:GenerateDataKey
               Resource: 
                 - !GetAtt DynamoDBKMSKey.Arn
-                - !Ref SNSKMSKey.Arn
+                - !GetAtt SNSKMSKey.Arn
 
   # VPC Configuration
   LambdaVPC:
